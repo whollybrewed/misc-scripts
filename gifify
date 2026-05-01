@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+set -e
+
+if [ $# -lt 3 ]; then
+  echo "Usage: $0 input_video seek_time duration_seconds"
+  echo "Example: $0 input.mp4 00:00:10 5"
+  exit 1
+fi
+
+INPUT="$1"
+SEEK="$2"
+DURATION="$3"
+
+# Derive output name (replace extension with .gif)
+OUTPUT="${INPUT%.*}.gif"
+
+PALETTE="$(mktemp --suffix=.png)"
+
+# Generate palette
+ffmpeg -ss "$SEEK" -t "$DURATION" -i "$INPUT" \
+  -vf "fps=15,scale=720:-1:flags=lanczos,palettegen=stats_mode=full" \
+  -y "$PALETTE"
+
+# Create GIF using palette
+ffmpeg -ss "$SEEK" -t "$DURATION" -i "$INPUT" -i "$PALETTE" \
+  -lavfi "fps=15,scale=720:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5" \
+  -y "$OUTPUT"
+
+rm -f "$PALETTE"
+
+echo "Saved: $OUTPUT"

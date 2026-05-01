@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ====== COLORS ======
+GREEN="\033[0;32m"
+YELLOW="\033[1;33m"
+NC="\033[0m"
+
+log() {
+  echo -e "${GREEN}$1${NC}"
+}
+
+warn() {
+  echo -e "${YELLOW}$1${NC}"
+}
+
+# ====== MODE (default DRY RUN) ======
+DRY_RUN=true
+if [[ "${1:-}" == "--apply" ]]; then
+  DRY_RUN=false
+  warn "Running in APPLY mode"
+else
+  warn "Running in DRY-RUN mode (no changes will be made)"
+  warn "Hint: add --apply to run in APPLY mode"
+fi
+
+# ====== TUNING ======
+TRANSFERS=16
+CHECKERS=32
+CHUNK_SIZE="64M"
+TPS_LIMIT=12
+
+COMMON_OPTS=(
+  --transfers=$TRANSFERS
+  --checkers=$CHECKERS
+  --fast-list
+  --drive-chunk-size=$CHUNK_SIZE
+  --tpslimit=$TPS_LIMIT
+  --tpslimit-burst=16
+  --buffer-size=128M
+  --progress
+  --stats=5s
+  --stats-one-line
+  --log-level=INFO
+  --retries=3
+  --low-level-retries=10
+)
+
+if [ "$DRY_RUN" = true ]; then
+  COMMON_OPTS+=(--dry-run)
+fi
+
+log "Checking Google Drive status..."
+rclone about gdrive:
+
+log "Starting parallel sync jobs..."
+
+run_sync() {
+  NAME="$1"
+  SRC="$2"
+  DST="$3"
+  rclone sync "$SRC" "$DST" "${COMMON_OPTS[@]}" 2>&1 | sed "s/^/[$NAME] /"
+}
+
+# ====== RUN JOBS IN PARALLEL ======
+PIDS=()
+run_sync "Pictures" ~/Pictures/ gdrive:/Pictures & PIDS+=($!)
+run_sync "Videos"   ~/Videos/   gdrive:/Videos   & PIDS+=($!)
+run_sync "Music"    ~/Music/    gdrive:/Music    & PIDS+=($!)
+run_sync "EBooks"   ~/EBooks/   gdrive:/EBooks   & PIDS+=($!)
+
+# ====== WAIT ======
+for pid in "${PIDS[@]}"; do
+  wait "$pid"
+done
+
+log "All sync jobs completed successfully."

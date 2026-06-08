@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+
+# mp4repack — normalize raw MP4s to a universally browser-safe format
+#
+# Raw screen recordings and hardware-encoded files (VA-API, NVENC, etc.)
+# often contain odd dimensions, non-standard timestamps, or encoder-specific
+# quirks that cause silent failures in browsers.
+#
+# This script re-encodes MP4s to a guaranteed-safe baseline:
+#   - H.264 (libx264), yuv420p, even dimensions
+#   - AAC audio, faststart moov atom for web streaming
+#   - Atomic writes: no partial outputs on failure
+#
+# Usage: mp4repack [INPUT_DIR] [OUTPUT_DIR] [-f]
+#   INPUT_DIR   Directory of source .mp4 files (default: .)
+#   OUTPUT_DIR  Destination directory          (default: ./out_convert)
+#   -f          Force overwrite without prompting
+#
+
+set -uo pipefail
+
+INPUT_DIR="${1:-.}"
+OUTPUT_DIR="${2:-./out_convert}"
+
+usage() {
+  echo "Usage: $(basename "$0") [INPUT_DIR] [OUTPUT_DIR] [-f]" >&2
+  echo "  -f    Force overwrite without prompting" >&2
+  echo "  Defaults: INPUT_DIR=. OUTPUT_DIR=./out_convert" >&2
+  exit 1
+}
+
+force=false
+for arg in "$@"; do
+  [[ "$arg" == "-h" || "$arg" == "--help" ]] && usage
+  [[ "$arg" == "-f" || "$arg" == "--force" ]] && force=true
+done
+
+if ! command -v ffmpeg &>/dev/null; then
+  echo "Error: ffmpeg not found in PATH" >&2
+  exit 1
+fi
+
+if [[ ! -d "$INPUT_DIR" ]]; then
+  echo "Error: input directory not found: $INPUT_DIR" >&2
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+shopt -s nullglob
+
+files=("$INPUT_DIR"/*.mp4)
+if [[ ${#files[@]} -eq 0 ]]; then
+  echo "No .mp4 files found in $INPUT_DIR"
+  exit 0
+fi
+
+# Collect existing outputs
+existing=()
+for file in "${files[@]}"; do
+  output="$OUTPUT_DIR/$(basename "$file")"
+  [[ -f "$output" ]] && existing+=("$(basename "$file")")
+done
+
+# Prompt once if conflicts exist and -f not set
+overwrite=false
+if [[ ${#existing[@]} -gt 0 ]]; then
+  if [[ "$force" == true ]]; then
+    overwrite=true
+  else
+    echo "${#existing[@]} output file(s) already exist:"
+    printf "  %s\n" "${existing[@]}"
+    echo ""
+    read -r -p "Overwrite all? [y/N] " answer </dev/tty
+    [[ "${answer,,}" == "y" ]] && overwrite=true
+  fi
+fi
+
+ok=0
+fail=0
+skip=0
+
+for file in "${files[@]}"; do
+  filename="$(basename "$file")"
+  output="$OUTPUT_DIR/$filename"
+  tmp="$OUTPUT_DIR/.tmp_$$_$filename"
+
+  if [[ -f "$output" ]] && [[ "$overwrite" == false ]]; then
+    echo "Skipping (exists): $filename"
+    ((skip++)) || true
+    continue
+  fi
+
+  echo "Converting: $filename"
+
+  if ffmpeg -y -hide_banner -loglevel error -stats \
+    -i "$file" \
+    -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+    -c:v libx264 \
+    -crf 18 \
+    -preset medium \
+    -profile:v high \
+    -level 4.1 \
+    -pix_fmt yuv420p \
+    -c:a aac \
+    -b:a 128k \
+    -movflags +faststart \
+    "$tmp"; then
+    mv "$tmp" "$output"
+    ((ok++)) || true
+  else
+    echo "FAILED: $filename" >&2
+    rm -f "$tmp"
+    ((fail++)) || true
+  fi
+done
+
+echo ""
+echo "Done. Output: $OUTPUT_DIR"
+printf "  %-8s %d\n" "OK:"      "$ok"
+printf "  %-8s %d\n" "Failed:"  "$fail"
+printf "  %-8s %d\n" "Skipped:" "$skip"
+
+[[ $fail -eq 0 ]]

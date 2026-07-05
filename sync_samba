@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# 
+# ─────────────────────────────────────────────────────────────────────────────
+# SETUP: Passwordless sudo for the mount (required for unattended/timer runs)
+# ─────────────────────────────────────────────────────────────────────────────
+# This script calls `sudo mount` internally. When run from a systemd timer there
+# is no terminal to type a sudo password into, so allow ONLY the mount commands
+# to run without a password.
+#
+# Run:  sudo visudo -f /etc/sudoers.d/dietpi-mount
+# Add the following lines (adjust binary paths if `which mount mkdir umount` differ):
+#
+#   ander ALL=(root) NOPASSWD: /usr/bin/mkdir -p /mnt/<SMB_SHARE>
+#   ander ALL=(root) NOPASSWD: /usr/bin/mount -t cifs //<SMB_HOST>/<SMB_SHARE> /mnt/<SMB_SHARE> *
+#   ander ALL=(root) NOPASSWD: /usr/bin/umount /mnt/<SMB_SHARE>
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# CREDENTIALS: SMB password is read from GNOME Keyring (no plaintext on disk).
+#   Store it once with:
+#     secret-tool store --label="DietPi SMB" service smb host <SMB_HOST> user <SMB_USER>
+#
+# DO NOT run this script with sudo/root — GNOME Keyring is per-user and root
+# cannot read your keyring. Run as your normal user; it uses sudo only internally.
+# 
+# ─────────────────────────────────────────────────────────────────────────────
+# REQUIRED: Create a config file first
+# All settings are loaded from:
+# 
+#     ${XDG_CONFIG_HOME:-$HOME/.config}/sync_samba/config
+#
+#   mkdir -p ~/.config/sync_samba
+#   cat > ~/.config/sync_samba/config <<'EOF'
+#   SMB_HOST="192.168.x.x"        # server IP or hostname
+#   SMB_SHARE="myshare"           # Samba share name
+#   SMB_USER="myuser"             # Samba username
+#   MOUNT="/mnt/myshare"          # Local mount point
+#   SRC="$HOME/Documents"         # source folder to mirror
+#   SUBDIR="Documents"            # subfolder name on the share
+#   RETENTION_DAYS=30             # auto-empty trash older than this many days
+#   EOF
+# ─────────────────────────────────────────────────────────────────────────────
+# 
+set -euo pipefail
+
+# ── Load configuration ──────────────────────────────────────────
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/sync_samba/config"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: Config file not found: $CONFIG_FILE" >&2
+    echo "" >&2
+    echo "Create it first, e.g.:" >&2
+    echo "  mkdir -p \"$(dirname "$CONFIG_FILE")\"" >&2
+    echo "  \$EDITOR \"$CONFIG_FILE\"" >&2
+    echo "" >&2
+    echo "See the header comment in this script for a template." >&2
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+# ── Validate required settings are present ──────────────────────
+: "${SMB_HOST:?SMB_HOST not set in $CONFIG_FILE}"
+: "${SMB_SHARE:?SMB_SHARE not set in $CONFIG_FILE}"
+: "${SMB_USER:?SMB_USER not set in $CONFIG_FILE}"
+: "${MOUNT:?MOUNT not set in $CONFIG_FILE}"
+: "${SRC:?SRC not set in $CONFIG_FILE}"
+: "${SUBDIR:?SUBDIR not set in $CONFIG_FILE}"
+: "${RETENTION_DAYS:?RETENTION_DAYS not set in $CONFIG_FILE}"
+
+# ── Derived values ──────────────────────────────────────────────
+DEST="$MOUNT/$SUBDIR"
+TRASH_ROOT="$MOUNT/.trash"
+TRASH="$TRASH_ROOT/$(date +%F_%H-%M-%S)"
+
+# ── Warn if run as root/sudo — breaks GNOME Keyring access ───────
+if [ "$(id -u)" -eq 0 ]; then
+    echo "ERROR: Do NOT run this script with sudo or as root." >&2
+    echo "" >&2
+    echo "  GNOME Keyring is per-user. Running as root can't read YOUR keyring," >&2
+    echo "  so the SMB password lookup would fail." >&2
+    echo "" >&2
+    echo "  Run it as your normal user:   ./sync_samba" >&2
+    echo "  (The script uses 'sudo' only for the mount step, and will prompt then.)" >&2
+    exit 1
+fi
+
+# ── Ensure required tools are installed ─────────────────────────
+ensure_installed() {
+    local missing=()
+    command -v mount.cifs  >/dev/null 2>&1 || missing+=("cifs-utils")
+    command -v secret-tool >/dev/null 2>&1 || missing+=("libsecret")
+    missing=($(printf "%s\n" "${missing[@]}" | sort -u))
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo "Installing missing packages: ${missing[*]}"
+        if   command -v dnf     >/dev/null 2>&1; then sudo dnf install -y "${missing[@]}"
+        elif command -v apt-get >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y "${missing[@]}"
+        elif command -v pacman  >/dev/null 2>&1; then sudo pacman -S --needed --noconfirm "${missing[@]}"
+        elif command -v zypper  >/dev/null 2>&1; then sudo zypper install -y "${missing[@]}"
+        else
+            echo "ERROR: No supported package manager found. Install manually: ${missing[*]}" >&2
+            exit 1
+        fi
+    fi
+}
+ensure_installed
+
+# ── Mount if not already mounted — password from GNOME Keyring ───
+if ! mountpoint -q "$MOUNT"; then
+    echo "Fetching SMB password from GNOME Keyring..."
+    SMB_PASS="$(secret-tool lookup service smb host "$SMB_HOST" user "$SMB_USER" || true)"
+    if [ -z "${SMB_PASS:-}" ]; then
+        echo "ERROR: No password in GNOME Keyring for $SMB_USER@$SMB_HOST." >&2
+        echo "Store it once with:" >&2
+        echo "  secret-tool store --label=\"DietPi SMB\" service smb host $SMB_HOST user $SMB_USER" >&2
+        exit 1
+    fi
+
+    echo "Mounting //$SMB_HOST/$SMB_SHARE → $MOUNT (sudo may prompt) ..."
+    sudo mkdir -p "$MOUNT"
+    sudo mount -t cifs "//$SMB_HOST/$SMB_SHARE" "$MOUNT" \
+        -o "username=$SMB_USER,password=$SMB_PASS,uid=$(id -u),gid=$(id -g),file_mode=0664,dir_mode=0775,iocharset=utf8"
+    unset SMB_PASS
+fi
+
+# ── CRITICAL safety check — never sync --delete into unmounted ───
+if ! mountpoint -q "$MOUNT"; then
+    echo "ERROR: $MOUNT not mounted. Aborting to protect your data." >&2
+    exit 1
+fi
+
+# ── Sync: mirror + rescuable deletions ──────────────────────────
+echo "Syncing $SRC → $DEST (mirror + trash)..."
+rclone sync "$SRC" "$DEST" \
+    -P --transfers 8 \
+    --checkers 16 \
+    --backup-dir "$TRASH"
+
+echo "Done. Deleted/overwritten files rescuable at: $TRASH"
+
+# ── Auto-empty trash older than RETENTION_DAYS ──────────────────
+[ -d "$TRASH_ROOT" ] && find "$TRASH_ROOT" -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" -exec rm -rf {} +
